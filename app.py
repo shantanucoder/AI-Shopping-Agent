@@ -2,13 +2,17 @@ import json
 import os
 import sqlite3
 from typing import Optional
-import gradio as gr
+
+import streamlit as st
 from google import genai
 from google.genai import types
 
 from reviews_api import get_product_rating, get_ratings_for_products
 from setup_db import create_database
 
+# ---------------------------------------------------------------------------
+# Database Setup
+# ---------------------------------------------------------------------------
 DB_PATH = os.path.join(os.path.dirname(__file__), "store.db")
 
 # Ensure the SQLite DB exists upon deployment
@@ -91,75 +95,89 @@ tools_map = {
 }
 
 # ---------------------------------------------------------------------------
-# Agent Chat Handler
+# Streamlit UI Setup
 # ---------------------------------------------------------------------------
+st.set_page_config(page_title="AI Shopping Assistant", page_icon="🛒", layout="wide")
+st.title("🛒 AI Shopping Assistant")
+st.caption("Tell me what you want — I'll search, rate, and order items from our store.")
 
-def chat_function(message, history):
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return (
-            "⚠️ Environment variable `GEMINI_API_KEY` is not set.\n"
-            "If using Hugging Face Spaces: Go to Settings > Variables and secrets > Add GEMINI_API_KEY.\n"
-            "If running locally: Set GEMINI_API_KEY in your environment or .env file."
-        )
+# Retrieve GEMINI_API_KEY from environment variables or Streamlit Secrets
+api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
 
-    # Initialize client dynamically per call
-    client = genai.Client(api_key=api_key)
-
-    # Construct chat context turn
-    contents = [{"role": "user", "parts": [{"text": message}]}]
-    
-    response = client.models.generate_content(
-        model='gemini-2.0-flash',
-        contents=contents,
-        config=types.GenerateContentConfig(
-            tools=[search_products, get_rating, checkout],
-            temperature=0,
-            system_instruction=(
-                "You are an AI shopping assistant. Use search_products to find items based on criteria. "
-                "Use get_rating to retrieve customer review scores if requested. "
-                "Only call checkout when the user explicitly confirms they want to place an order."
-            )
-        )
+if not api_key:
+    st.error(
+        "⚠️ `GEMINI_API_KEY` is missing.\n\n"
+        "Please add `GEMINI_API_KEY` in **Streamlit Cloud -> Settings -> Secrets**."
     )
+    st.stop()
 
-    # Execute tool loop for sequential function calls
-    while response.function_calls:
-        for call in response.function_calls:
-            tool_name = call.name
-            tool_args = call.args
+client = genai.Client(api_key=api_key)
+
+# Maintain Chat History in Session State
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display prior chat messages
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Process New User Input
+if prompt := st.chat_input("e.g., I want organic honey under 15 dollars"):
+    # Render user prompt
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Generate assistant response
+    with st.chat_message("assistant"):
+        with st.spinner("Searching store database..."):
+            contents = [{"role": "user", "parts": [{"text": prompt}]}]
             
-            if tool_name in tools_map:
-                tool_output = tools_map[tool_name](**tool_args)
-                
-                # Append assistant function request and user execution response
-                contents.append({"role": "model", "parts": [{"function_call": call}]})
-                contents.append({
-                    "role": "user",
-                    "parts": [{"function_response": {"name": tool_name, "response": {"result": tool_output}}}]
-                })
-
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=contents,
-            config=types.GenerateContentConfig(
-                tools=[search_products, get_rating, checkout],
-                temperature=0,
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    tools=[search_products, get_rating, checkout],
+                    temperature=0,
+                    system_instruction=(
+                        "You are an AI shopping assistant. Use search_products to find items based on criteria. "
+                        "Use get_rating to retrieve customer review scores if requested. "
+                        "Only call checkout when the user explicitly confirms they want to place an order."
+                    ),
+                ),
             )
-        )
 
-    return response.text
+            # Handle Function/Tool Call Loop
+            while response.function_calls:
+                for call in response.function_calls:
+                    tool_name = call.name
+                    tool_args = call.args
 
-# ---------------------------------------------------------------------------
-# Gradio Application Interface
-# ---------------------------------------------------------------------------
+                    if tool_name in tools_map:
+                        tool_output = tools_map[tool_name](**tool_args)
 
-demo = gr.ChatInterface(
-    fn=chat_function,
-    title="🛒 AI Shopping Assistant",
-    description="Ask for products (e.g., 'I want organic honey under 15 dollar').",
-)
+                        contents.append({"role": "model", "parts": [{"function_call": call}]})
+                        contents.append({
+                            "role": "user",
+                            "parts": [{
+                                "function_response": {
+                                    "name": tool_name,
+                                    "response": {"result": tool_output},
+                                }
+                            }],
+                        })
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        tools=[search_products, get_rating, checkout],
+                        temperature=0,
+                    ),
+                )
+
+            final_text = response.text or "I completed the action."
+            st.markdown(final_text)
+
+    st.session_state.messages.append({"role": "assistant", "content": final_text})
